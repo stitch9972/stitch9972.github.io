@@ -238,9 +238,87 @@ function parseMetadata(body, format = config.format) {
  }
  return {title:titleValue(source?.title),artist:titleValue(source?.artist)};
 }
+// Встроенный ICY-парсер. Сервер пока не открывает icy-metaint через CORS:
+// 16000 подтверждено для этого потока 11.11.2026. При смене настроек проверить заново.
+const ICY_METAINT_FALLBACK = 16000;
+async function readIcyTrack(signal) {
+ const response = await fetch(config.audioUrl, {
+   headers: {'Icy-MetaData':'1'}, credentials:'omit', cache:'no-store', signal
+ });
+ if (!response.ok || !response.body) {
+   await response.body?.cancel();
+   throw Error('Источник ICY недоступен.');
+ }
+ const reader = response.body.getReader();
+ try {
+   const raw = response.headers.get('icy-metaint');
+   const interval = raw === null ? ICY_METAINT_FALLBACK : Number(raw);
+   if (!Number.isInteger(interval) || interval < 1 || interval > 262144) throw Error('Неверный интервал ICY.');
+   let chunk = new Uint8Array(0), offset = 0, total = 0;
+   async function consume(size, keep = false) {
+     const out = keep ? new Uint8Array(size) : null;
+     let done = 0;
+     while (done < size) {
+       if (signal.aborted) throw new DOMException('Aborted','AbortError');
+       if (offset === chunk.length) {
+         const part = await reader.read();
+         if (part.done) throw Error('Поток завершился без названия.');
+         chunk = part.value; offset = 0;
+       }
+       const count = Math.min(size - done, chunk.length - offset);
+       if (total + count > 524288) throw Error('Название пока не получено из ICY.');
+       if (out) out.set(chunk.subarray(offset, offset + count), done);
+       offset += count; done += count; total += count;
+     }
+     return out;
+   }
+   for (;;) {
+     await consume(interval);
+     const length = (await consume(1,true))[0] * 16;
+     if (!length) continue;
+     const bytes = await consume(length,true);
+     let text = new TextDecoder('utf-8').decode(bytes);
+     if (text.includes('\uFFFD')) text = new TextDecoder('windows-1251').decode(bytes);
+     const match = /StreamTitle='([\s\S]*?)';/.exec(text);
+     const title = match?.[1].replace(/[\u0000-\u001f\u007f]/g,'').trim().slice(0,500);
+     if (title) return title;
+   }
+ } finally { try { await reader.cancel(); } catch (_) {} }
+}
+function stopIcyMetadata() {
+ if (config.metadataUrl) return;
+ ++generation;
+ if (controller) { controller.abort(); controller = null; }
+ setTrack('Название пока недоступно');
+ $('metaStatus').textContent = 'Название появится во время прослушивания эфира.';
+}
+async function fetchIcyMetadata() {
+ if (audio.paused || audio.ended || document.hidden) { stopIcyMetadata(); return; }
+ if (controller) return; // Не создавать параллельные запросы к потоку.
+ const version = ++generation;
+ const current = new AbortController(); controller = current;
+ const timeout = setTimeout(() => current.abort(),8000);
+ try {
+   const title = await readIcyTrack(current.signal);
+   if (version !== generation || audio.paused || document.hidden) return;
+   setTrack(title);
+   $('metaStatus').textContent = 'Из эфира · обновлено в ' + new Date().toLocaleTimeString('ru-RU');
+ } catch (e) {
+   if (version !== generation) return;
+   setTrack('Название пока недоступно');
+   $('metaStatus').textContent = e.name === 'AbortError'
+     ? 'Название не получено вовремя. Повторим запрос автоматически.'
+     : 'Название недоступно: проверьте CORS и интервал ICY. Эфир работает независимо.';
+ } finally {
+   clearTimeout(timeout);
+   current.abort();
+   if (controller === current) controller = null;
+ }
+}
+
 async function fetchMetadata() {
+ if (!config.metadataUrl) return fetchIcyMetadata();
  if (controller) controller.abort(); const version = ++generation;
- if (!config.metadataUrl) { setTrack('Название пока недоступно'); $('metaStatus').textContent = 'Источник названий треков пока не подключён.'; return; }
  if (location.protocol === 'https:' && new URL(config.metadataUrl).protocol !== 'https:') { setTrack('Название пока недоступно'); $('metaStatus').textContent = 'Нужен HTTPS-адрес метаданных.'; return; }
  const current = new AbortController(); controller = current; const timeout = setTimeout(() => current.abort(), 9000);
  try { const response = await fetch(config.metadataUrl, {cache:'no-store', credentials:'omit', signal:current.signal}); if (!response.ok) throw Error('HTTP ' + response.status); const text = await response.text(); if (version !== generation) return; const meta = parseMetadata(text); if (!meta.title) throw Error('Сервер не передал название трека.'); setTrack(meta.title, meta.artist); $('metaStatus').textContent = 'Данные сервера · обновлено в ' + new Date().toLocaleTimeString('ru-RU'); }
@@ -254,8 +332,13 @@ $('videoDialog').addEventListener('close', () => { const video = $('videoContain
 if (!safeUrl(config.audioUrl)) config = {...RADIO_CONFIG};
 if (config.metadataUrl && !safeUrl(config.metadataUrl)) config.metadataUrl = '';
 audio.src = config.audioUrl; fetchMetadata();
-setInterval(() => { if (!document.hidden) fetchMetadata(); }, Math.max(10,config.pollSeconds)*1000);
-document.addEventListener('visibilitychange', () => { if (!document.hidden) fetchMetadata(); });
+// Второе короткое соединение только во время прослушивания и на видимой вкладке.
+// Название обновляется не синхронно с аудиобуфером; возможна небольшая задержка.
+audio.addEventListener('playing', () => { fetchMetadata(); });
+for (const event of ['pause','ended','error']) audio.addEventListener(event, stopIcyMetadata);
+setInterval(() => { if (!document.hidden) fetchMetadata(); }, Math.max(config.metadataUrl ? 10 : 30,config.pollSeconds)*1000);
+document.addEventListener('visibilitychange', () => { if (!document.hidden) fetchMetadata(); else stopIcyMetadata(); });
+window.addEventListener('pagehide', stopIcyMetadata);
 
 // Сворачивание меняет только интерфейс: audio не удаляется и не останавливается.
 const playerToggle = $('playerToggle');
